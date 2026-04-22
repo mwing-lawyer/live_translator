@@ -22,6 +22,7 @@ const sessionManager = new SessionManager();
 const wss = new WebSocketServer({ server, path: "/ws/twilio" });
 
 wss.on("connection", (ws, req) => {
+  console.log("req", req);
   new TwilioStreamHandler(ws, sessionManager, req);
 });
 
