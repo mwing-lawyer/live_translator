@@ -48,7 +48,7 @@ export class TwilioStreamHandler {
         this.role = params.role;
         const sessionId = params.sessionId;
         const lang = params.lang;
-
+        console.log("params", this.urlParams);
         console.log(
           `Twilio start: sessionId=${sessionId}, role=${this.role}, lang=${lang}, ` +
           `streamSid=${this.streamSid}, callSid=${this.callSid}`
