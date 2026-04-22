@@ -9,7 +9,9 @@ export class TwilioStreamHandler {
    */
   constructor(ws, sessionManager, req) {
     const url = new URL(req.url, `http://${req.headers.host}`);
+    console.log("url", url);
     this.urlParams = Object.fromEntries(url.searchParams);
+    console.log("urlParams", this.urlParams);
     this.ws = ws;
     this.sm = sessionManager;
     this.streamSid = null;
