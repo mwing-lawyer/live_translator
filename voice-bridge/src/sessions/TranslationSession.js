@@ -67,6 +67,9 @@ export class TranslationSession {
 
     this.callerToRepClient = null;
     this.repToCallerClient = null;
+
+    this._audioCounts = { caller: 0, rep: 0 };
+    this._dropLogged = { caller: false, rep: false };
   }
 
   /**
@@ -144,9 +147,29 @@ export class TranslationSession {
    * Called when a Twilio media chunk arrives from a leg.
    */
   onTwilioAudio(role, base64Mulaw) {
-    if (this.state !== STATES.ACTIVE) return;
+    if (this.state !== STATES.ACTIVE) {
+      if (!this._dropLogged[role]) {
+        console.warn(
+          `Session ${this.sessionId}: dropping audio for role=${role}, state=${this.state}`
+        );
+        this._dropLogged[role] = true;
+      }
+      return;
+    }
 
     const pcm16Base64 = twilioToOpenAI(base64Mulaw);
+
+    this._audioCounts[role] = (this._audioCounts[role] || 0) + 1;
+    const n = this._audioCounts[role];
+    if (n === 1) {
+      console.log(
+        `Session ${this.sessionId}: first audio frame from ${role} -> RealtimeClient`
+      );
+    } else if (n % 250 === 0) {
+      console.log(
+        `Session ${this.sessionId}: forwarded ${n} frames from ${role}`
+      );
+    }
 
     if (role === "caller" && this.callerToRepClient) {
       this.callerToRepClient.sendAudio(pcm16Base64);

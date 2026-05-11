@@ -29,7 +29,19 @@ export class RealtimeClient {
     this.reconnectTimer = null;
     this.ws = null;
 
+    this.eventCounts = {};
+    this.totalEvents = 0;
+    this.unknownEventTypes = new Set();
+    this.firstSeen = new Set();
+    this.audioPacketsSent = 0;
+
     this._connect();
+  }
+
+  _logFirst(key, message) {
+    if (this.firstSeen.has(key)) return;
+    this.firstSeen.add(key);
+    console.log(message);
   }
 
   _connect() {
@@ -51,7 +63,7 @@ export class RealtimeClient {
   _onOpen() {
     console.log("OpenAI Realtime WS connected");
     this.reconnectAttempts = 0;
-    this._send({
+    const sessionUpdate = {
       type: "session.update",
       session: {
         modalities: ["audio", "text"],
@@ -67,7 +79,9 @@ export class RealtimeClient {
           silence_duration_ms: config.vad.silenceDurationMs,
         },
       },
-    });
+    };
+    console.log(`OpenAI session.update sent: ${JSON.stringify(sessionUpdate)}`);
+    this._send(sessionUpdate);
   }
 
   _onMessage(raw) {
@@ -77,6 +91,12 @@ export class RealtimeClient {
     } catch {
       console.error("OpenAI WS: unparseable message");
       return;
+    }
+
+    this.eventCounts[msg.type] = (this.eventCounts[msg.type] || 0) + 1;
+    this.totalEvents++;
+    if (this.totalEvents % 100 === 0) {
+      console.log(`OpenAI events: ${JSON.stringify(this.eventCounts)}`);
     }
 
     switch (msg.type) {
@@ -90,10 +110,18 @@ export class RealtimeClient {
         break;
 
       case "response.created":
+        this._logFirst(
+          "response.created",
+          `OpenAI: response.created id=${msg.response?.id}`
+        );
         this.onResponseStart();
         break;
 
       case "response.audio.delta":
+        this._logFirst(
+          "response.audio.delta",
+          `OpenAI: first audio.delta bytes=${(msg.delta || "").length}`
+        );
         this.onAudioDelta(msg.delta);
         break;
 
@@ -105,13 +133,30 @@ export class RealtimeClient {
         break;
 
       case "response.audio_transcript.done":
+        console.log(`OpenAI: transcript done "${msg.transcript}"`);
         this.onTranscript(msg.transcript, true);
         break;
 
+      case "response.done":
+        this._logFirst(
+          "response.done",
+          `OpenAI: response.done status=${msg.response?.status}`
+        );
+        break;
+
       case "input_audio_buffer.speech_started":
+        this._logFirst("speech_started", "OpenAI VAD: speech_started");
         break;
 
       case "input_audio_buffer.speech_stopped":
+        this._logFirst(
+          "speech_stopped",
+          `OpenAI VAD: speech_stopped (item_id=${msg.item_id})`
+        );
+        break;
+
+      case "input_audio_buffer.committed":
+        this._logFirst("committed", "OpenAI: buffer committed");
         break;
 
       case "error":
@@ -120,6 +165,10 @@ export class RealtimeClient {
         break;
 
       default:
+        if (!this.unknownEventTypes.has(msg.type)) {
+          this.unknownEventTypes.add(msg.type);
+          console.log(`OpenAI: unhandled event type=${msg.type}`);
+        }
         break;
     }
   }
@@ -151,6 +200,14 @@ export class RealtimeClient {
    * @param {string} base64Pcm16 - base64-encoded PCM16 24 kHz audio
    */
   sendAudio(base64Pcm16) {
+    this.audioPacketsSent++;
+    if (this.audioPacketsSent === 1) {
+      console.log(
+        `OpenAI: sending first input_audio_buffer.append (bytes=${(base64Pcm16 || "").length})`
+      );
+    } else if (this.audioPacketsSent % 250 === 0) {
+      console.log(`OpenAI: sent ${this.audioPacketsSent} audio packets`);
+    }
     this._send({
       type: "input_audio_buffer.append",
       audio: base64Pcm16,

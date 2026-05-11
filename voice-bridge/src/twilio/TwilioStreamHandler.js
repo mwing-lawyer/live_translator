@@ -18,6 +18,8 @@ export class TwilioStreamHandler {
     this.callSid = null;
     this.session = null;
     this.role = null;
+    this.mediaCount = 0;
+    this.droppedLogged = false;
 
     ws.on("message", (raw) => this._onMessage(raw));
     ws.on("close", () => this._onClose());
@@ -58,11 +60,28 @@ export class TwilioStreamHandler {
         break;
       }
 
-      case "media":
-        if (this.session && this.role) {
-          this.session.onTwilioAudio(this.role, msg.media.payload);
+      case "media": {
+        if (!this.session || !this.role) {
+          if (!this.droppedLogged) {
+            console.warn(
+              `Twilio media DROPPED: session=${!!this.session} role=${this.role} streamSid=${this.streamSid}`
+            );
+            this.droppedLogged = true;
+          }
+          break;
         }
+        this.mediaCount++;
+        if (this.mediaCount === 1) {
+          const payload = msg.media?.payload || "";
+          console.log(
+            `Twilio media: first frame for role=${this.role} streamSid=${this.streamSid} bytes=${payload.length}`
+          );
+        } else if (this.mediaCount % 250 === 0) {
+          console.log(`Twilio media: role=${this.role} frames=${this.mediaCount}`);
+        }
+        this.session.onTwilioAudio(this.role, msg.media.payload);
         break;
+      }
 
       case "stop":
         console.log(`Twilio stop: streamSid=${this.streamSid}`);
