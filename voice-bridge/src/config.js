@@ -9,7 +9,7 @@ const optional = (name, fallback) => process.env[name] || fallback;
 export const config = {
   port: parseInt(optional("PORT", "8080"), 10),
   openaiApiKey: required("OPENAI_API_KEY"),
-  openaiModel: optional("OPENAI_MODEL", "gpt-4o-realtime-preview"),
+  openaiModel: optional("OPENAI_MODEL", "gpt-realtime-translate"),
   callbackUrl: optional("CALLBACK_URL", ""),
   logLevel: optional("LOG_LEVEL", "info"),
 

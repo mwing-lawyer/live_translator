@@ -1,27 +1,27 @@
 import WebSocket from "ws";
 import { config } from "../config.js";
 
-const OPENAI_REALTIME_URL = `wss://api.openai.com/v1/realtime?model=${config.openaiModel}`;
+const OPENAI_REALTIME_URL = `wss://api.openai.com/v1/realtime/translations?model=${config.openaiModel}`;
 const MAX_RECONNECT_ATTEMPTS = 3;
 const RECONNECT_BASE_MS = 1000;
 
 export class RealtimeClient {
   /**
    * @param {object} opts
-   * @param {string} opts.instructions - System prompt for this translation direction
-   * @param {(base64Pcm: string) => void} opts.onAudioDelta - Called per translated audio chunk
-   * @param {(text: string, isFinal: boolean) => void} opts.onTranscript - Called on transcript events
+   * @param {string} opts.targetLanguage - ISO 639-1 code for the output language (e.g. "en", "es")
+   * @param {(base64Pcm: string) => void} opts.onAudioDelta - Called per translated audio chunk (PCM16 24 kHz, base64)
+   * @param {(text: string, isFinal: boolean) => void} opts.onTranscript - Called on translated (target-language) transcript events
+   * @param {(text: string, isFinal: boolean) => void} [opts.onSourceTranscript] - Called on source-language transcript events
    * @param {() => void} [opts.onReady] - Called when session is configured and ready
-   * @param {() => void} [opts.onResponseStart] - Called when a new translation response begins
    * @param {(err: Error) => void} [opts.onError] - Called on unrecoverable errors
    */
   constructor(opts) {
     this.opts = opts;
-    this.instructions = opts.instructions;
+    this.targetLanguage = opts.targetLanguage;
     this.onAudioDelta = opts.onAudioDelta;
     this.onTranscript = opts.onTranscript;
+    this.onSourceTranscript = opts.onSourceTranscript || (() => {});
     this.onReady = opts.onReady || (() => {});
-    this.onResponseStart = opts.onResponseStart || (() => {});
     this.onError = opts.onError || ((err) => console.error("RealtimeClient error:", err));
 
     this.closed = false;
@@ -48,7 +48,6 @@ export class RealtimeClient {
     this.ws = new WebSocket(OPENAI_REALTIME_URL, {
       headers: {
         Authorization: `Bearer ${config.openaiApiKey}`,
-        "OpenAI-Beta": "realtime=v1",
       },
     });
 
@@ -61,22 +60,17 @@ export class RealtimeClient {
   }
 
   _onOpen() {
-    console.log("OpenAI Realtime WS connected");
+    console.log("OpenAI Realtime Translations WS connected");
     this.reconnectAttempts = 0;
     const sessionUpdate = {
       type: "session.update",
       session: {
-        modalities: ["audio", "text"],
-        instructions: this.instructions,
-        voice: "alloy",
-        input_audio_format: "pcm16",
-        output_audio_format: "pcm16",
-        input_audio_transcription: { model: "whisper-1" },
-        turn_detection: {
-          type: "server_vad",
-          threshold: config.vad.threshold,
-          prefix_padding_ms: config.vad.prefixPaddingMs,
-          silence_duration_ms: config.vad.silenceDurationMs,
+        audio: {
+          input: {
+            transcription: { model: "gpt-realtime-whisper" },
+            noise_reduction: { type: "near_field" },
+          },
+          output: { language: this.targetLanguage },
         },
       },
     };
@@ -105,58 +99,40 @@ export class RealtimeClient {
         break;
 
       case "session.updated":
-        console.log("OpenAI session configured");
+        console.log(`OpenAI session configured (target=${this.targetLanguage})`);
         this.onReady();
         break;
 
-      case "response.created":
+      case "session.output_audio.delta":
         this._logFirst(
-          "response.created",
-          `OpenAI: response.created id=${msg.response?.id}`
-        );
-        this.onResponseStart();
-        break;
-
-      case "response.audio.delta":
-        this._logFirst(
-          "response.audio.delta",
-          `OpenAI: first audio.delta bytes=${(msg.delta || "").length}`
+          "session.output_audio.delta",
+          `OpenAI: first output_audio.delta bytes=${(msg.delta || "").length}`
         );
         this.onAudioDelta(msg.delta);
         break;
 
-      case "response.audio.done":
+      case "session.output_audio.done":
         break;
 
-      case "response.audio_transcript.delta":
+      case "session.output_transcript.delta":
         this.onTranscript(msg.delta, false);
         break;
 
-      case "response.audio_transcript.done":
-        console.log(`OpenAI: transcript done "${msg.transcript}"`);
+      case "session.output_transcript.done":
+        console.log(`OpenAI: output transcript done "${msg.transcript}"`);
         this.onTranscript(msg.transcript, true);
         break;
 
-      case "response.done":
+      case "session.input_transcript.delta":
+        this.onSourceTranscript(msg.delta, false);
+        break;
+
+      case "session.input_transcript.done":
         this._logFirst(
-          "response.done",
-          `OpenAI: response.done status=${msg.response?.status}`
+          "session.input_transcript.done",
+          `OpenAI: input transcript done "${msg.transcript}"`
         );
-        break;
-
-      case "input_audio_buffer.speech_started":
-        this._logFirst("speech_started", "OpenAI VAD: speech_started");
-        break;
-
-      case "input_audio_buffer.speech_stopped":
-        this._logFirst(
-          "speech_stopped",
-          `OpenAI VAD: speech_stopped (item_id=${msg.item_id})`
-        );
-        break;
-
-      case "input_audio_buffer.committed":
-        this._logFirst("committed", "OpenAI: buffer committed");
+        this.onSourceTranscript(msg.transcript, true);
         break;
 
       case "error":
@@ -203,13 +179,13 @@ export class RealtimeClient {
     this.audioPacketsSent++;
     if (this.audioPacketsSent === 1) {
       console.log(
-        `OpenAI: sending first input_audio_buffer.append (bytes=${(base64Pcm16 || "").length})`
+        `OpenAI: sending first session.input_audio_buffer.append (bytes=${(base64Pcm16 || "").length})`
       );
     } else if (this.audioPacketsSent % 250 === 0) {
       console.log(`OpenAI: sent ${this.audioPacketsSent} audio packets`);
     }
     this._send({
-      type: "input_audio_buffer.append",
+      type: "session.input_audio_buffer.append",
       audio: base64Pcm16,
     });
   }

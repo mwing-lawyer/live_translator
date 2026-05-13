@@ -9,44 +9,6 @@ const STATES = {
   CLOSED: "closed",
 };
 
-const LANG_NAMES = {
-  en: "English",
-  es: "Spanish",
-  fr: "French",
-  pt: "Portuguese",
-  de: "German",
-  it: "Italian",
-  hi: "Hindi",
-  zh: "Mandarin Chinese",
-  ja: "Japanese",
-  ko: "Korean",
-  ar: "Arabic",
-  ru: "Russian",
-  pl: "Polish",
-  nl: "Dutch",
-  tr: "Turkish",
-  vi: "Vietnamese",
-  th: "Thai",
-  tl: "Tagalog",
-  uk: "Ukrainian",
-  he: "Hebrew",
-  sw: "Swahili",
-};
-
-function langName(code) {
-  return LANG_NAMES[code] || code;
-}
-
-function buildInstructions(fromLang, toLang) {
-  const from = langName(fromLang);
-  const to = langName(toLang);
-  return (
-    `You are a real-time voice translator. Listen to the incoming ${from} audio ` +
-    `and produce a faithful ${to} translation. Speak only the translation, nothing else. ` +
-    `Preserve tone and urgency. Do not add commentary.`
-  );
-}
-
 export class TranslationSession {
   /**
    * @param {string} sessionId - Unique session identifier from PHP
@@ -109,13 +71,10 @@ export class TranslationSession {
     console.log(`Session ${this.sessionId}: both legs paired, starting translation (${dirLabel} / ${revLabel})`);
 
     this.callerToRepClient = new RealtimeClient({
-      instructions: buildInstructions(this.callerLang, this.repLang),
+      targetLanguage: this.repLang,
       onAudioDelta: (base64Pcm) => {
         const payload = openAIToTwilio(base64Pcm);
         this._sendToTwilio(this.repWs, this.repStreamSid, payload);
-      },
-      onResponseStart: () => {
-        this._clearTwilioBuffer(this.repWs, this.repStreamSid);
       },
       onTranscript: (text, isFinal) => {
         notify(this.sessionId, "caller", dirLabel, text, isFinal);
@@ -126,13 +85,10 @@ export class TranslationSession {
     });
 
     this.repToCallerClient = new RealtimeClient({
-      instructions: buildInstructions(this.repLang, this.callerLang),
+      targetLanguage: this.callerLang,
       onAudioDelta: (base64Pcm) => {
         const payload = openAIToTwilio(base64Pcm);
         this._sendToTwilio(this.callerWs, this.callerStreamSid, payload);
-      },
-      onResponseStart: () => {
-        this._clearTwilioBuffer(this.callerWs, this.callerStreamSid);
       },
       onTranscript: (text, isFinal) => {
         notify(this.sessionId, "rep", revLabel, text, isFinal);
