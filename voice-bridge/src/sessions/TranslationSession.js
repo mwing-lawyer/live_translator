@@ -71,6 +71,7 @@ export class TranslationSession {
     console.log(`Session ${this.sessionId}: both legs paired, starting translation (${dirLabel} / ${revLabel})`);
 
     this.callerToRepClient = new RealtimeClient({
+      sourceLanguage: this.callerLang,
       targetLanguage: this.repLang,
       onAudioDelta: (base64Pcm) => {
         const payload = openAIToTwilio(base64Pcm);
@@ -85,6 +86,7 @@ export class TranslationSession {
     });
 
     this.repToCallerClient = new RealtimeClient({
+      sourceLanguage: this.repLang,
       targetLanguage: this.callerLang,
       onAudioDelta: (base64Pcm) => {
         const payload = openAIToTwilio(base64Pcm);

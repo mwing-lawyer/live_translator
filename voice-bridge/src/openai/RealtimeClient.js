@@ -9,6 +9,7 @@ export class RealtimeClient {
   /**
    * @param {object} opts
    * @param {string} opts.targetLanguage - ISO 639-1 code for the output language (e.g. "en", "es")
+   * @param {string} [opts.sourceLanguage] - ISO 639-1 code for the source language hint (improves accuracy and latency)
    * @param {(base64Pcm: string) => void} opts.onAudioDelta - Called per translated audio chunk (PCM16 24 kHz, base64)
    * @param {(text: string, isFinal: boolean) => void} opts.onTranscript - Called on translated (target-language) transcript events
    * @param {(text: string, isFinal: boolean) => void} [opts.onSourceTranscript] - Called on source-language transcript events
@@ -18,6 +19,7 @@ export class RealtimeClient {
   constructor(opts) {
     this.opts = opts;
     this.targetLanguage = opts.targetLanguage;
+    this.sourceLanguage = opts.sourceLanguage;
     this.onAudioDelta = opts.onAudioDelta;
     this.onTranscript = opts.onTranscript;
     this.onSourceTranscript = opts.onSourceTranscript || (() => {});
@@ -62,12 +64,16 @@ export class RealtimeClient {
   _onOpen() {
     console.log("OpenAI Realtime Translations WS connected");
     this.reconnectAttempts = 0;
+    const transcription = { model: "gpt-realtime-whisper" };
+    if (this.sourceLanguage) {
+      transcription.language = this.sourceLanguage;
+    }
     const sessionUpdate = {
       type: "session.update",
       session: {
         audio: {
           input: {
-            transcription: { model: "gpt-realtime-whisper" },
+            transcription,
             noise_reduction: { type: "near_field" },
           },
           output: { language: this.targetLanguage },
@@ -99,7 +105,9 @@ export class RealtimeClient {
         break;
 
       case "session.updated":
-        console.log(`OpenAI session configured (target=${this.targetLanguage})`);
+        console.log(
+          `OpenAI session configured (source=${this.sourceLanguage || "auto"}, target=${this.targetLanguage})`
+        );
         this.onReady();
         break;
 
