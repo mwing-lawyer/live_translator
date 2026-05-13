@@ -64,16 +64,12 @@ export class RealtimeClient {
   _onOpen() {
     console.log("OpenAI Realtime Translations WS connected");
     this.reconnectAttempts = 0;
-    const transcription = { model: "gpt-realtime-whisper" };
-    if (this.sourceLanguage) {
-      transcription.language = this.sourceLanguage;
-    }
     const sessionUpdate = {
       type: "session.update",
       session: {
         audio: {
           input: {
-            transcription,
+            transcription: { model: "gpt-realtime-whisper" },
             noise_reduction: { type: "near_field" },
           },
           output: { language: this.targetLanguage },
