@@ -1,26 +1,23 @@
 import WebSocket from "ws";
 import { config } from "../config.js";
 
-const OPENAI_REALTIME_URL = `wss://api.openai.com/v1/realtime?model=${config.openaiModel}`;
+const OPENAI_REALTIME_URL = `wss://api.openai.com/v1/realtime/translations?model=${config.openaiModel}`;
 const MAX_RECONNECT_ATTEMPTS = 3;
 const RECONNECT_BASE_MS = 1000;
-const STALL_THRESHOLD_MS = 5000;
 const TRANSCRIPT_IDLE_MS = 1200;
 
 export class RealtimeClient {
   /**
    * @param {object} opts
    * @param {string} opts.targetLanguage - ISO 639-1 code for the output language (e.g. "en", "es")
-   * @param {string} [opts.sourceLanguage] - ISO 639-1 code for the source language (used in log lines and prompt)
-   * @param {string} opts.instructions - System prompt for the model (translation instructions)
-   * @param {string} opts.voice - Voice id (e.g. "verse", "alloy", "echo")
-   * @param {"g711_ulaw" | "pcm16"} [opts.audioFormat] - Wire format for audio in/out. Default from config.
+   * @param {string} [opts.sourceLanguage] - ISO 639-1 code for the source language (used in log lines only;
+   *        the translations endpoint rejects audio.input.transcription.language and auto-detects).
    * @param {string} [opts.logLabel] - Direction tag prefixed on every log line (e.g. "en->es"). Defaults to targetLanguage.
-   * @param {(b64Audio: string) => void} opts.onAudioDelta - Called per translated audio chunk (mulaw 8 kHz if g711_ulaw, PCM16 24 kHz if pcm16).
+   * @param {(b64Pcm16: string) => void} opts.onAudioDelta - Called per translated audio chunk (PCM16 24 kHz, base64).
    * @param {(text: string, isFinal: boolean) => void} opts.onTranscript - Called on translated transcript events
    * @param {(text: string, isFinal: boolean) => void} [opts.onSourceTranscript] - Called on source-language transcript events
    * @param {() => void} [opts.onReady] - Called when session is configured and ready
-   * @param {(format: "g711_ulaw" | "pcm16") => void} [opts.onAudioFormatNegotiated] - Called when the effective wire format is known
+   * @param {(format: "pcm16") => void} [opts.onAudioFormatNegotiated] - Called when the effective wire format is known
    * @param {(err: Error) => void} [opts.onError] - Called on unrecoverable errors
    */
   constructor(opts) {
@@ -28,13 +25,8 @@ export class RealtimeClient {
     this.targetLanguage = opts.targetLanguage;
     this.sourceLanguage = opts.sourceLanguage;
     this.logLabel = opts.logLabel || opts.targetLanguage || "?";
-    this.instructions = opts.instructions || "";
-    this.voice = opts.voice || config.openaiVoice;
-    this.audioFormat = opts.audioFormat || config.openaiAudioFormat;
-    if (this.audioFormat !== "g711_ulaw" && this.audioFormat !== "pcm16") {
-      this._log(`WARN unknown audioFormat="${this.audioFormat}", forcing "g711_ulaw"`, "warn");
-      this.audioFormat = "g711_ulaw";
-    }
+    // The translations endpoint hardcodes PCM16 24 kHz. Pin and warn if anything else slips through.
+    this.audioFormat = "pcm16";
 
     this.onAudioDelta = opts.onAudioDelta;
     this.onTranscript = opts.onTranscript || (() => {});
@@ -57,8 +49,6 @@ export class RealtimeClient {
 
     this.lastInputFrameAt = 0;
     this.lastOutputAudioAt = 0;
-    this._lastTurnCommittedAt = 0;
-    this._stallReported = false;
 
     this._inputBuf = "";
     this._outputBuf = "";
@@ -130,76 +120,24 @@ export class RealtimeClient {
     });
   }
 
-  /**
-   * Push a source-language hint into an already-open session. Useful when the
-   * client was pre-warmed before the speaker leg attached (sourceLanguage="auto"),
-   * and we now know what language to expect.
-   */
-  setSourceLanguage(lang) {
-    if (!lang || lang === "auto" || lang === this.sourceLanguage) return;
-    this.sourceLanguage = lang;
-    this.logLabel = `${lang}->${this.targetLanguage}`;
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this._send({
-        type: "session.update",
-        session: {
-          audio: {
-            input: {
-              transcription: { model: "gpt-realtime-whisper", language: lang },
-            },
-          },
-        },
-      });
-      this._log(`source language updated to "${lang}"`);
-    }
-  }
-
-  _audioFormatBlock() {
-    return this.audioFormat === "g711_ulaw"
-      ? { type: "audio/pcmu" }
-      : { type: "audio/pcm", rate: 24000 };
-  }
-
   _onOpen() {
-    this._log(`Realtime WS connected (model=${config.openaiModel}, audioFormat=${this.audioFormat}, voice=${this.voice})`);
+    this._log(`Realtime Translations WS connected (model=${config.openaiModel})`);
     this.reconnectAttempts = 0;
-    const transcription = { model: "gpt-realtime-whisper" };
-    if (this.sourceLanguage && this.sourceLanguage !== "auto") {
-      transcription.language = this.sourceLanguage;
-    }
     const sessionUpdate = {
       type: "session.update",
       session: {
-        type: "realtime",
-        model: config.openaiModel,
-        output_modalities: ["audio"],
-        instructions: this.instructions,
         audio: {
           input: {
-            format: this._audioFormatBlock(),
-            transcription,
+            transcription: { model: "gpt-realtime-whisper" },
             noise_reduction: { type: "near_field" },
-            turn_detection: {
-              type: "server_vad",
-              threshold: 0.5,
-              prefix_padding_ms: 300,
-              silence_duration_ms: config.turnDetectionSilenceMs,
-              create_response: true,
-              interrupt_response: true,
-            },
           },
           output: {
-            format: this._audioFormatBlock(),
-            voice: this.voice,
+            language: this.targetLanguage,
           },
         },
       },
     };
-    this._log(
-      `session.update sent (instructions=${this.instructions.length} chars, ` +
-      `silence_duration_ms=${config.turnDetectionSilenceMs}, ` +
-      `transcription.language=${transcription.language || "auto"})`
-    );
+    this._log(`session.update sent: ${JSON.stringify(sessionUpdate)}`);
     this._send(sessionUpdate);
   }
 
@@ -225,32 +163,18 @@ export class RealtimeClient {
 
       case "session.updated":
         this._log(
-          `session configured (source=${this.sourceLanguage || "auto"}, target=${this.targetLanguage}, ` +
-          `audioFormat=${this.audioFormat}, voice=${this.voice})`
+          `session configured (source=${this.sourceLanguage || "auto"}, target=${this.targetLanguage}, audioFormat=${this.audioFormat})`
         );
         this.onAudioFormatNegotiated(this.audioFormat);
         this.onReady();
         break;
 
-      case "response.created":
-        this._logFirst("response.created", `first response.created id=${msg.response?.id}`);
-        break;
-
-      case "response.done":
-        // Not chatty per response; the heard/translated lines tell the story.
-        break;
-
-      case "response.output_audio.delta":
+      case "session.output_audio.delta":
         this.audioDeltasReceived++;
         this.lastOutputAudioAt = Date.now();
-        this._lastTurnCommittedAt = 0;
-        if (this._stallReported) {
-          this._log(`translation resumed after stall`);
-          this._stallReported = false;
-        }
         this._logFirst(
-          "response.output_audio.delta",
-          `first response.output_audio.delta bytes=${(msg.delta || "").length}`
+          "session.output_audio.delta",
+          `first session.output_audio.delta bytes=${(msg.delta || "").length}`
         );
         if (this.audioDeltasReceived % 250 === 0) {
           this._log(`audio out deltas=${this.audioDeltasReceived}`);
@@ -258,57 +182,27 @@ export class RealtimeClient {
         this.onAudioDelta(msg.delta);
         break;
 
-      case "response.output_audio.done":
+      case "session.output_audio.done":
         break;
 
-      case "response.output_audio_transcript.delta":
+      case "session.output_transcript.delta":
         this._appendTranscript("output", msg.delta);
         this.onTranscript(msg.delta, false);
         break;
 
-      case "response.output_audio_transcript.done":
+      case "session.output_transcript.done":
         this._flushTranscript("output", "done", msg.transcript);
         this.onTranscript(msg.transcript, true);
         break;
 
-      case "conversation.item.input_audio_transcription.delta":
+      case "session.input_transcript.delta":
         this._appendTranscript("input", msg.delta);
         this.onSourceTranscript(msg.delta, false);
         break;
 
-      case "conversation.item.input_audio_transcription.completed":
+      case "session.input_transcript.done":
         this._flushTranscript("input", "done", msg.transcript);
         this.onSourceTranscript(msg.transcript, true);
-        break;
-
-      case "conversation.item.input_audio_transcription.failed":
-        this._log(`input transcription failed: ${JSON.stringify(msg.error)}`, "warn");
-        break;
-
-      case "input_audio_buffer.speech_started":
-        this._logFirst("input_audio_buffer.speech_started", `first speech_started`);
-        break;
-
-      case "input_audio_buffer.speech_stopped":
-        this._logFirst("input_audio_buffer.speech_stopped", `first speech_stopped`);
-        break;
-
-      case "input_audio_buffer.committed":
-        // Server VAD committed a turn; create_response: true will trigger a response next.
-        this._lastTurnCommittedAt = Date.now();
-        break;
-
-      case "conversation.item.added":
-      case "conversation.item.done":
-      case "response.output_item.added":
-      case "response.output_item.done":
-      case "response.content_part.added":
-      case "response.content_part.done":
-        // GA conversation/response lifecycle events we observe but do not act on.
-        break;
-
-      case "rate_limits.updated":
-        // Periodic rate limit info; ignore.
         break;
 
       case "error":
@@ -349,37 +243,21 @@ export class RealtimeClient {
 
   /**
    * Stream an audio chunk to OpenAI for translation.
-   * @param {string} b64Audio - base64-encoded audio in the negotiated format
-   *        (mulaw 8 kHz when audioFormat === "g711_ulaw", PCM16 24 kHz when "pcm16")
+   * @param {string} base64Pcm16 - base64-encoded PCM16 24 kHz audio
    */
-  sendAudio(b64Audio) {
+  sendAudio(base64Pcm16) {
     this.audioPacketsSent++;
     this.lastInputFrameAt = Date.now();
     if (this.audioPacketsSent === 1) {
       this._log(
-        `sending first input_audio_buffer.append (bytes=${(b64Audio || "").length}, format=${this.audioFormat})`
+        `sending first session.input_audio_buffer.append (bytes=${(base64Pcm16 || "").length})`
       );
     } else if (this.audioPacketsSent % 250 === 0) {
       this._log(`sent ${this.audioPacketsSent} audio packets`);
     }
-
-    if (
-      !this._stallReported &&
-      this._lastTurnCommittedAt > 0 &&
-      Date.now() - this._lastTurnCommittedAt > STALL_THRESHOLD_MS
-    ) {
-      const stalledMs = Date.now() - this._lastTurnCommittedAt;
-      this._log(
-        `WARN translation stalled: turn committed ${stalledMs}ms ago but no ` +
-        `response.output_audio.delta yet (audioDeltasReceived=${this.audioDeltasReceived})`,
-        "warn"
-      );
-      this._stallReported = true;
-    }
-
     this._send({
-      type: "input_audio_buffer.append",
-      audio: b64Audio,
+      type: "session.input_audio_buffer.append",
+      audio: base64Pcm16,
     });
   }
 
