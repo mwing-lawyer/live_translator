@@ -118,7 +118,6 @@ export class RealtimeClient {
     this.ws = new WebSocket(OPENAI_REALTIME_URL, {
       headers: {
         Authorization: `Bearer ${config.openaiApiKey}`,
-        "OpenAI-Beta": "realtime=v1",
       },
     });
 
@@ -130,30 +129,51 @@ export class RealtimeClient {
     });
   }
 
+  _audioFormatBlock() {
+    return this.audioFormat === "g711_ulaw"
+      ? { type: "audio/pcmu" }
+      : { type: "audio/pcm", rate: 24000 };
+  }
+
   _onOpen() {
     this._log(`Realtime WS connected (model=${config.openaiModel}, audioFormat=${this.audioFormat}, voice=${this.voice})`);
     this.reconnectAttempts = 0;
+    const transcription = { model: "gpt-realtime-whisper" };
+    if (this.sourceLanguage && this.sourceLanguage !== "auto") {
+      transcription.language = this.sourceLanguage;
+    }
     const sessionUpdate = {
       type: "session.update",
       session: {
-        modalities: ["audio", "text"],
+        type: "realtime",
+        model: config.openaiModel,
+        output_modalities: ["audio"],
         instructions: this.instructions,
-        voice: this.voice,
-        input_audio_format: this.audioFormat,
-        output_audio_format: this.audioFormat,
-        input_audio_transcription: { model: "whisper-1" },
-        turn_detection: {
-          type: "server_vad",
-          threshold: 0.5,
-          prefix_padding_ms: 300,
-          silence_duration_ms: config.turnDetectionSilenceMs,
-          create_response: true,
+        audio: {
+          input: {
+            format: this._audioFormatBlock(),
+            transcription,
+            noise_reduction: { type: "near_field" },
+            turn_detection: {
+              type: "server_vad",
+              threshold: 0.5,
+              prefix_padding_ms: 300,
+              silence_duration_ms: config.turnDetectionSilenceMs,
+              create_response: true,
+              interrupt_response: true,
+            },
+          },
+          output: {
+            format: this._audioFormatBlock(),
+            voice: this.voice,
+          },
         },
       },
     };
     this._log(
       `session.update sent (instructions=${this.instructions.length} chars, ` +
-      `silence_duration_ms=${config.turnDetectionSilenceMs})`
+      `silence_duration_ms=${config.turnDetectionSilenceMs}, ` +
+      `transcription.language=${transcription.language || "auto"})`
     );
     this._send(sessionUpdate);
   }
@@ -195,7 +215,7 @@ export class RealtimeClient {
         // Not chatty per response; the heard/translated lines tell the story.
         break;
 
-      case "response.audio.delta":
+      case "response.output_audio.delta":
         this.audioDeltasReceived++;
         this.lastOutputAudioAt = Date.now();
         if (this._stallReported) {
@@ -203,8 +223,8 @@ export class RealtimeClient {
           this._stallReported = false;
         }
         this._logFirst(
-          "response.audio.delta",
-          `first response.audio.delta bytes=${(msg.delta || "").length}`
+          "response.output_audio.delta",
+          `first response.output_audio.delta bytes=${(msg.delta || "").length}`
         );
         if (this.audioDeltasReceived % 250 === 0) {
           this._log(`audio out deltas=${this.audioDeltasReceived}`);
@@ -212,15 +232,15 @@ export class RealtimeClient {
         this.onAudioDelta(msg.delta);
         break;
 
-      case "response.audio.done":
+      case "response.output_audio.done":
         break;
 
-      case "response.audio_transcript.delta":
+      case "response.output_audio_transcript.delta":
         this._appendTranscript("output", msg.delta);
         this.onTranscript(msg.delta, false);
         break;
 
-      case "response.audio_transcript.done":
+      case "response.output_audio_transcript.done":
         this._flushTranscript("output", "done", msg.transcript);
         this.onTranscript(msg.transcript, true);
         break;
@@ -314,7 +334,7 @@ export class RealtimeClient {
     ) {
       const stalledMs = Date.now() - this.lastOutputAudioAt;
       this._log(
-        `WARN translation stalled: no response.audio.delta for ${stalledMs}ms ` +
+        `WARN translation stalled: no response.output_audio.delta for ${stalledMs}ms ` +
         `while still receiving input frames (audioPacketsSent=${this.audioPacketsSent}, ` +
         `audioDeltasReceived=${this.audioDeltasReceived})`,
         "warn"
