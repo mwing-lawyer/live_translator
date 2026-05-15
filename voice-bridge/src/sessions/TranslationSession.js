@@ -80,6 +80,14 @@ export class TranslationSession {
     const otherRole = role === "caller" ? "rep" : "caller";
     if (this.legs[otherRole].ws) {
       this._ensureClientForListener(otherRole);
+
+      // Push the now-known source language into the direction that was
+      // pre-warmed back when this leg wasn't attached yet (it was opened with
+      // sourceLanguage="auto"). The pre-warmed direction is the one whose
+      // SOURCE is THIS just-attached leg.
+      const preWarmedDirKey = role === "caller" ? "callerToRep" : "repToCaller";
+      this[preWarmedDirKey].client?.setSourceLanguage(leg.lang);
+
       if (this.state === STATES.WAITING) {
         this.state = STATES.ACTIVE;
         console.log(

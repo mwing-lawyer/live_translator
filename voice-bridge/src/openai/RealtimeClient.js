@@ -57,6 +57,7 @@ export class RealtimeClient {
 
     this.lastInputFrameAt = 0;
     this.lastOutputAudioAt = 0;
+    this._lastTurnCommittedAt = 0;
     this._stallReported = false;
 
     this._inputBuf = "";
@@ -127,6 +128,30 @@ export class RealtimeClient {
     this.ws.on("error", (err) => {
       this._log(`WS transport error: ${err.message}`, "error");
     });
+  }
+
+  /**
+   * Push a source-language hint into an already-open session. Useful when the
+   * client was pre-warmed before the speaker leg attached (sourceLanguage="auto"),
+   * and we now know what language to expect.
+   */
+  setSourceLanguage(lang) {
+    if (!lang || lang === "auto" || lang === this.sourceLanguage) return;
+    this.sourceLanguage = lang;
+    this.logLabel = `${lang}->${this.targetLanguage}`;
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this._send({
+        type: "session.update",
+        session: {
+          audio: {
+            input: {
+              transcription: { model: "gpt-realtime-whisper", language: lang },
+            },
+          },
+        },
+      });
+      this._log(`source language updated to "${lang}"`);
+    }
   }
 
   _audioFormatBlock() {
@@ -218,6 +243,7 @@ export class RealtimeClient {
       case "response.output_audio.delta":
         this.audioDeltasReceived++;
         this.lastOutputAudioAt = Date.now();
+        this._lastTurnCommittedAt = 0;
         if (this._stallReported) {
           this._log(`translation resumed after stall`);
           this._stallReported = false;
@@ -269,6 +295,16 @@ export class RealtimeClient {
 
       case "input_audio_buffer.committed":
         // Server VAD committed a turn; create_response: true will trigger a response next.
+        this._lastTurnCommittedAt = Date.now();
+        break;
+
+      case "conversation.item.added":
+      case "conversation.item.done":
+      case "response.output_item.added":
+      case "response.output_item.done":
+      case "response.content_part.added":
+      case "response.content_part.done":
+        // GA conversation/response lifecycle events we observe but do not act on.
         break;
 
       case "rate_limits.updated":
@@ -329,14 +365,13 @@ export class RealtimeClient {
 
     if (
       !this._stallReported &&
-      this.lastOutputAudioAt > 0 &&
-      Date.now() - this.lastOutputAudioAt > STALL_THRESHOLD_MS
+      this._lastTurnCommittedAt > 0 &&
+      Date.now() - this._lastTurnCommittedAt > STALL_THRESHOLD_MS
     ) {
-      const stalledMs = Date.now() - this.lastOutputAudioAt;
+      const stalledMs = Date.now() - this._lastTurnCommittedAt;
       this._log(
-        `WARN translation stalled: no response.output_audio.delta for ${stalledMs}ms ` +
-        `while still receiving input frames (audioPacketsSent=${this.audioPacketsSent}, ` +
-        `audioDeltasReceived=${this.audioDeltasReceived})`,
+        `WARN translation stalled: turn committed ${stalledMs}ms ago but no ` +
+        `response.output_audio.delta yet (audioDeltasReceived=${this.audioDeltasReceived})`,
         "warn"
       );
       this._stallReported = true;
