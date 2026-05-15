@@ -34,11 +34,6 @@ export const config = {
     silenceDurationMs: parseInt(optional("VAD_SILENCE_DURATION_MS", "500"), 10),
   },
 
-  mix: {
-    duckGain: parseFloat(optional("MIX_DUCK_GAIN", "0.15")),
-    originalGain: parseFloat(optional("MIX_ORIGINAL_GAIN", "1.0")),
-  },
-
   bridgeVad: {
     rmsThreshold: parseFloat(optional("BRIDGE_VAD_RMS_THRESHOLD", "600")),
     speakHoldMs: parseInt(optional("BRIDGE_VAD_SPEAK_HOLD_MS", "60"), 10),

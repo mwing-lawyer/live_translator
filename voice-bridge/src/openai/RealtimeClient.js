@@ -4,12 +4,14 @@ import { config } from "../config.js";
 const OPENAI_REALTIME_URL = `wss://api.openai.com/v1/realtime/translations?model=${config.openaiModel}`;
 const MAX_RECONNECT_ATTEMPTS = 3;
 const RECONNECT_BASE_MS = 1000;
+const STALL_THRESHOLD_MS = 5000;
 
 export class RealtimeClient {
   /**
    * @param {object} opts
    * @param {string} opts.targetLanguage - ISO 639-1 code for the output language (e.g. "en", "es")
    * @param {string} [opts.sourceLanguage] - ISO 639-1 code for the source language (used only in log lines)
+   * @param {string} [opts.logLabel] - Direction tag prefixed on every log line (e.g. "en->es"). Defaults to targetLanguage.
    * @param {"pcmu" | "pcm16"} [opts.audioFormat] - Currently ignored. The
    *        /v1/realtime/translations endpoint hardcodes PCM16 24 kHz both ways.
    *        Kept for forward compatibility; a "pcmu" request logs a warning and
@@ -27,12 +29,14 @@ export class RealtimeClient {
     this.opts = opts;
     this.targetLanguage = opts.targetLanguage;
     this.sourceLanguage = opts.sourceLanguage;
+    this.logLabel = opts.logLabel || opts.targetLanguage || "?";
     const requestedFormat = opts.audioFormat || config.openaiAudioFormat;
     if (requestedFormat && requestedFormat !== "pcm16") {
-      console.warn(
-        `RealtimeClient: audioFormat="${requestedFormat}" requested but the ` +
+      this._log(
+        `WARN audioFormat="${requestedFormat}" requested but the ` +
         `/v1/realtime/translations endpoint only supports PCM16 24 kHz. ` +
-        `Forcing audioFormat="pcm16".`
+        `Forcing audioFormat="pcm16".`,
+        "warn"
       );
     }
     this.audioFormat = "pcm16";
@@ -41,7 +45,7 @@ export class RealtimeClient {
     this.onSourceTranscript = opts.onSourceTranscript || (() => {});
     this.onReady = opts.onReady || (() => {});
     this.onAudioFormatNegotiated = opts.onAudioFormatNegotiated || (() => {});
-    this.onError = opts.onError || ((err) => console.error("RealtimeClient error:", err));
+    this.onError = opts.onError || ((err) => this._log(`error: ${err.message}`, "error"));
 
     this.closed = false;
     this.reconnectAttempts = 0;
@@ -53,14 +57,25 @@ export class RealtimeClient {
     this.unknownEventTypes = new Set();
     this.firstSeen = new Set();
     this.audioPacketsSent = 0;
+    this.audioDeltasReceived = 0;
+
+    this.lastInputFrameAt = 0;
+    this.lastOutputAudioAt = 0;
+    this._stallReported = false;
 
     this._connect();
+  }
+
+  _log(message, level = "log") {
+    const prefix = `OpenAI[${this.logLabel}]:`;
+    const fn = level === "error" ? console.error : level === "warn" ? console.warn : console.log;
+    fn(`${prefix} ${message}`);
   }
 
   _logFirst(key, message) {
     if (this.firstSeen.has(key)) return;
     this.firstSeen.add(key);
-    console.log(message);
+    this._log(message);
   }
 
   _connect() {
@@ -74,12 +89,12 @@ export class RealtimeClient {
     this.ws.on("message", (raw) => this._onMessage(raw));
     this.ws.on("close", (code) => this._onClose(code));
     this.ws.on("error", (err) => {
-      console.error("OpenAI WS transport error:", err.message);
+      this._log(`WS transport error: ${err.message}`, "error");
     });
   }
 
   _onOpen() {
-    console.log(`OpenAI Realtime Translations WS connected (audioFormat=${this.audioFormat})`);
+    this._log(`Realtime Translations WS connected (audioFormat=${this.audioFormat})`);
     this.reconnectAttempts = 0;
     const sessionUpdate = {
       type: "session.update",
@@ -95,7 +110,7 @@ export class RealtimeClient {
         },
       },
     };
-    console.log(`OpenAI session.update sent: ${JSON.stringify(sessionUpdate)}`);
+    this._log(`session.update sent: ${JSON.stringify(sessionUpdate)}`);
     this._send(sessionUpdate);
   }
 
@@ -104,34 +119,43 @@ export class RealtimeClient {
     try {
       msg = JSON.parse(raw.toString());
     } catch {
-      console.error("OpenAI WS: unparseable message");
+      this._log("WS unparseable message", "error");
       return;
     }
 
     this.eventCounts[msg.type] = (this.eventCounts[msg.type] || 0) + 1;
     this.totalEvents++;
     if (this.totalEvents % 100 === 0) {
-      console.log(`OpenAI events: ${JSON.stringify(this.eventCounts)}`);
+      this._log(`events: ${JSON.stringify(this.eventCounts)}`);
     }
 
     switch (msg.type) {
       case "session.created":
-        console.log("OpenAI session created:", msg.session?.id);
+        this._log(`session created: ${msg.session?.id}`);
         break;
 
       case "session.updated":
-        console.log(
-          `OpenAI session configured (source=${this.sourceLanguage || "auto"}, target=${this.targetLanguage}, audioFormat=${this.audioFormat})`
+        this._log(
+          `session configured (source=${this.sourceLanguage || "auto"}, target=${this.targetLanguage}, audioFormat=${this.audioFormat})`
         );
         this.onAudioFormatNegotiated(this.audioFormat);
         this.onReady();
         break;
 
       case "session.output_audio.delta":
+        this.audioDeltasReceived++;
+        this.lastOutputAudioAt = Date.now();
+        if (this._stallReported) {
+          this._log(`translation resumed after stall`);
+          this._stallReported = false;
+        }
         this._logFirst(
           "session.output_audio.delta",
-          `OpenAI: first output_audio.delta bytes=${(msg.delta || "").length}`
+          `first output_audio.delta bytes=${(msg.delta || "").length}`
         );
+        if (this.audioDeltasReceived % 250 === 0) {
+          this._log(`audio out deltas=${this.audioDeltasReceived}`);
+        }
         this.onAudioDelta(msg.delta);
         break;
 
@@ -143,7 +167,7 @@ export class RealtimeClient {
         break;
 
       case "session.output_transcript.done":
-        console.log(`OpenAI: output transcript done "${msg.transcript}"`);
+        this._log(`output transcript done "${msg.transcript}"`);
         this.onTranscript(msg.transcript, true);
         break;
 
@@ -154,20 +178,20 @@ export class RealtimeClient {
       case "session.input_transcript.done":
         this._logFirst(
           "session.input_transcript.done",
-          `OpenAI: input transcript done "${msg.transcript}"`
+          `input transcript done "${msg.transcript}"`
         );
         this.onSourceTranscript(msg.transcript, true);
         break;
 
       case "error":
-        console.error("OpenAI API error:", JSON.stringify(msg.error));
+        this._log(`API error: ${JSON.stringify(msg.error)}`, "error");
         this.onError(new Error(msg.error?.message || "OpenAI error"));
         break;
 
       default:
         if (!this.unknownEventTypes.has(msg.type)) {
           this.unknownEventTypes.add(msg.type);
-          console.log(`OpenAI: unhandled event type=${msg.type}`);
+          this._log(`unhandled event type=${msg.type}`);
         }
         break;
     }
@@ -176,15 +200,15 @@ export class RealtimeClient {
   _onClose(code) {
     if (this.closed) return;
 
-    console.warn(`OpenAI Realtime WS closed unexpectedly (code=${code})`);
+    this._log(`Realtime WS closed unexpectedly (code=${code})`, "warn");
 
     if (this.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
       const delayMs = RECONNECT_BASE_MS * Math.pow(2, this.reconnectAttempts);
       this.reconnectAttempts++;
-      console.log(`OpenAI reconnect attempt ${this.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${delayMs}ms`);
+      this._log(`reconnect attempt ${this.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${delayMs}ms`);
       this.reconnectTimer = setTimeout(() => this._connect(), delayMs);
     } else {
-      console.error("OpenAI reconnect attempts exhausted");
+      this._log("reconnect attempts exhausted", "error");
       this.onError(new Error("OpenAI WebSocket reconnect failed after max attempts"));
     }
   }
@@ -201,13 +225,33 @@ export class RealtimeClient {
    */
   sendAudio(base64Pcm16) {
     this.audioPacketsSent++;
+    this.lastInputFrameAt = Date.now();
     if (this.audioPacketsSent === 1) {
-      console.log(
-        `OpenAI: sending first session.input_audio_buffer.append (bytes=${(base64Pcm16 || "").length})`
+      this._log(
+        `sending first session.input_audio_buffer.append (bytes=${(base64Pcm16 || "").length})`
       );
     } else if (this.audioPacketsSent % 250 === 0) {
-      console.log(`OpenAI: sent ${this.audioPacketsSent} audio packets`);
+      this._log(`sent ${this.audioPacketsSent} audio packets`);
     }
+
+    // Stall detection: if we have ever received output audio but none in the
+    // last STALL_THRESHOLD_MS while input is still flowing, log once. Resets
+    // when a new output_audio.delta arrives.
+    if (
+      !this._stallReported &&
+      this.lastOutputAudioAt > 0 &&
+      Date.now() - this.lastOutputAudioAt > STALL_THRESHOLD_MS
+    ) {
+      const stalledMs = Date.now() - this.lastOutputAudioAt;
+      this._log(
+        `WARN translation stalled: no output_audio.delta for ${stalledMs}ms ` +
+        `while still receiving input frames (audioPacketsSent=${this.audioPacketsSent}, ` +
+        `audioDeltasReceived=${this.audioDeltasReceived})`,
+        "warn"
+      );
+      this._stallReported = true;
+    }
+
     this._send({
       type: "session.input_audio_buffer.append",
       audio: base64Pcm16,

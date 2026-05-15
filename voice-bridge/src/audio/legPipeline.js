@@ -1,28 +1,24 @@
-import { mulawDecode, mulawEncode } from "./codec.js";
+import { mulawDecode } from "./codec.js";
 import { config } from "../config.js";
 
 const SAMPLE_RATE = 8000;
 const FRAME_MS = 20;
 const FRAME_BYTES = (SAMPLE_RATE * FRAME_MS) / 1000; // 160
-const MAX_BUFFER_BYTES = SAMPLE_RATE * 2; // 2s of audio cap per buffer
+const MAX_BUFFER_BYTES = SAMPLE_RATE * 2; // 2s of audio cap on translated buffer
 const MULAW_SILENCE = 0xFF; // mu-law byte for digital zero
 
 /**
  * One LegPipeline owns the audio path for a single Twilio leg's *ear*:
  * the audio that this leg's listener hears.
  *
- * It mixes:
- *   - originalQueue: mulaw frames from the OTHER leg's mic (the speaker)
- *   - translatedQueue: mulaw frames produced by OpenAI for THIS leg's ear
- *
- * It runs a 20 ms output pacer that always emits a frame to Twilio so the
- * listener never hears dead air. When translated audio is playing, the original
- * is ducked under it; when no translation is playing, the listener hears the
- * speaker's original voice at full volume.
+ * It buffers translated mulaw frames produced by OpenAI for THIS leg's ear
+ * and emits them on a 20 ms pacer so Twilio sees a steady cadence. When no
+ * translated frame is queued, silence is emitted (the listener never hears
+ * the speaker's original voice).
  *
  * It also runs an energy VAD on the leg's OWN mic (pushOwnMic) so we can
- * implement soft barge-in: while this leg is speaking, we stop forcing
- * translated audio into their ear.
+ * implement soft barge-in: while this leg is speaking, queued translated
+ * frames are dropped so the listener can hear themselves immediately.
  */
 export class LegPipeline {
   /**
@@ -41,9 +37,6 @@ export class LegPipeline {
     this.onSelfSpeechChange = onSelfSpeechChange || (() => {});
 
     /** @type {Buffer[]} */
-    this.originalQueue = [];
-    this.originalLen = 0;
-    /** @type {Buffer[]} */
     this.translatedQueue = [];
     this.translatedLen = 0;
 
@@ -54,30 +47,14 @@ export class LegPipeline {
     this.closed = false;
     this.stats = {
       framesSent: 0,
-      framesMixed: 0,
+      framesTranslated: 0,
+      framesSilent: 0,
       framesBargedIn: 0,
-      framesUnderrunOrig: 0,
-      droppedOriginalBytes: 0,
       droppedTranslatedBytes: 0,
       hardClears: 0,
     };
 
     this._tickHandle = setInterval(() => this._tick(), FRAME_MS);
-  }
-
-  /**
-   * Audio from the OTHER leg's mic, base64-encoded mulaw 8 kHz.
-   */
-  pushOriginal(mulawBase64) {
-    if (this.closed || !mulawBase64) return;
-    const buf = Buffer.from(mulawBase64, "base64");
-    this.originalQueue.push(buf);
-    this.originalLen += buf.length;
-    while (this.originalLen > MAX_BUFFER_BYTES && this.originalQueue.length > 0) {
-      const old = this.originalQueue.shift();
-      this.originalLen -= old.length;
-      this.stats.droppedOriginalBytes += old.length;
-    }
   }
 
   /**
@@ -152,14 +129,13 @@ export class LegPipeline {
       clearInterval(this._tickHandle);
       this._tickHandle = null;
     }
-    this.originalQueue = [];
     this.translatedQueue = [];
-    this.originalLen = 0;
     this.translatedLen = 0;
     console.log(
       `Session ${this.sessionId}: ${this.role} pipeline closed ` +
-      `framesSent=${this.stats.framesSent} mixed=${this.stats.framesMixed} ` +
-      `bargedIn=${this.stats.framesBargedIn} hardClears=${this.stats.hardClears}`
+      `framesSent=${this.stats.framesSent} translated=${this.stats.framesTranslated} ` +
+      `silent=${this.stats.framesSilent} bargedIn=${this.stats.framesBargedIn} ` +
+      `hardClears=${this.stats.hardClears}`
     );
   }
 
@@ -167,27 +143,18 @@ export class LegPipeline {
     if (this.closed) return;
     if (!this.ws || this.ws.readyState !== 1) return;
 
-    const original = this._popExact("originalQueue", "originalLen", FRAME_BYTES);
     const translated = this._popExact("translatedQueue", "translatedLen", FRAME_BYTES);
 
     let outMulaw;
-
     if (translated && this.isSpeaking) {
-      // Soft barge-in: discard the translated frame, listener hears their own
-      // mic context via the original-from-other-leg path (or silence).
-      outMulaw = original || this._silence();
+      outMulaw = this._silence();
       this.stats.framesBargedIn++;
     } else if (translated) {
-      // Mix translated at full + original ducked.
-      const orig = original || this._silence();
-      outMulaw = this._mix(orig, translated, config.mix.duckGain, 1.0);
-      this.stats.framesMixed++;
+      outMulaw = translated;
+      this.stats.framesTranslated++;
     } else {
-      // No translation queued; pass through original at full volume.
-      outMulaw = original
-        ? (config.mix.originalGain === 1.0 ? original : this._scale(original, config.mix.originalGain))
-        : this._silence();
-      if (!original) this.stats.framesUnderrunOrig++;
+      outMulaw = this._silence();
+      this.stats.framesSilent++;
     }
 
     this.ws.send(JSON.stringify({
@@ -204,8 +171,8 @@ export class LegPipeline {
     } else if (this.stats.framesSent % 1000 === 0) {
       console.log(
         `Session ${this.sessionId}: ${this.role} pipeline ` +
-        `sent=${this.stats.framesSent} mixed=${this.stats.framesMixed} ` +
-        `bargedIn=${this.stats.framesBargedIn} origQ=${this.originalLen}B ` +
+        `sent=${this.stats.framesSent} translated=${this.stats.framesTranslated} ` +
+        `silent=${this.stats.framesSilent} bargedIn=${this.stats.framesBargedIn} ` +
         `txQ=${this.translatedLen}B speaking=${this.isSpeaking}`
       );
     }
@@ -235,30 +202,5 @@ export class LegPipeline {
 
   _silence() {
     return Buffer.alloc(FRAME_BYTES, MULAW_SILENCE);
-  }
-
-  _mix(aMulaw, bMulaw, gainA, gainB) {
-    const len = Math.min(aMulaw.length, bMulaw.length);
-    const out = Buffer.alloc(len);
-    for (let i = 0; i < len; i++) {
-      const a = mulawDecode(aMulaw[i]);
-      const b = mulawDecode(bMulaw[i]);
-      let mixed = Math.round(a * gainA + b * gainB);
-      if (mixed > 32767) mixed = 32767;
-      else if (mixed < -32768) mixed = -32768;
-      out[i] = mulawEncode(mixed);
-    }
-    return out;
-  }
-
-  _scale(mulaw, gain) {
-    const out = Buffer.alloc(mulaw.length);
-    for (let i = 0; i < mulaw.length; i++) {
-      let s = Math.round(mulawDecode(mulaw[i]) * gain);
-      if (s > 32767) s = 32767;
-      else if (s < -32768) s = -32768;
-      out[i] = mulawEncode(s);
-    }
-    return out;
   }
 }

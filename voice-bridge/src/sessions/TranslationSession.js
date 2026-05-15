@@ -117,6 +117,7 @@ export class TranslationSession {
     slot.client = new RealtimeClient({
       sourceLanguage: speakerLang || undefined,
       targetLanguage: targetLang,
+      logLabel: dirLabel,
       onAudioFormatNegotiated: (fmt) => {
         slot.format = fmt;
         console.log(
@@ -156,11 +157,6 @@ export class TranslationSession {
 
     // Drive bridge-side VAD on this leg's own mic.
     leg.pipeline?.pushOwnMic(base64Mulaw);
-
-    // Feed the OTHER leg's ear with this leg's original audio (so they always
-    // hear the speaker, even when the model is silent).
-    const otherRole = role === "caller" ? "rep" : "caller";
-    this.legs[otherRole].pipeline?.pushOriginal(base64Mulaw);
 
     // Send to OpenAI for translation.
     const directionKey = role === "caller" ? "callerToRep" : "repToCaller";
