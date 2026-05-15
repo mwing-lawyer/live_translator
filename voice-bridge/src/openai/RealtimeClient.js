@@ -167,7 +167,7 @@ export class RealtimeClient {
         break;
 
       case "session.output_transcript.done":
-        this._log(`output transcript done "${msg.transcript}"`);
+        this._log(`translated: "${msg.transcript}"`);
         this.onTranscript(msg.transcript, true);
         break;
 
@@ -176,10 +176,7 @@ export class RealtimeClient {
         break;
 
       case "session.input_transcript.done":
-        this._logFirst(
-          "session.input_transcript.done",
-          `input transcript done "${msg.transcript}"`
-        );
+        this._log(`heard: "${msg.transcript}"`);
         this.onSourceTranscript(msg.transcript, true);
         break;
 
