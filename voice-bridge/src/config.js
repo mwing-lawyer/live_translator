@@ -12,7 +12,10 @@ const optionalBool = (name, fallback) => {
   return /^(1|true|yes|on)$/i.test(v);
 };
 
-const audioFormat = optional("OPENAI_AUDIO_FORMAT", "pcmu").toLowerCase();
+// OPENAI_AUDIO_FORMAT is currently a no-op: the /v1/realtime/translations
+// endpoint hardcodes PCM16 24 kHz. Parsing is kept so older deploys do not
+// crash, but the value is forced to "pcm16" downstream.
+const audioFormat = optional("OPENAI_AUDIO_FORMAT", "pcm16").toLowerCase();
 if (audioFormat !== "pcmu" && audioFormat !== "pcm16") {
   throw new Error(`OPENAI_AUDIO_FORMAT must be "pcmu" or "pcm16", got "${audioFormat}"`);
 }

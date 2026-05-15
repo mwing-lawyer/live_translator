@@ -117,7 +117,6 @@ export class TranslationSession {
     slot.client = new RealtimeClient({
       sourceLanguage: speakerLang || undefined,
       targetLanguage: targetLang,
-      audioFormat: config.openaiAudioFormat,
       onAudioFormatNegotiated: (fmt) => {
         slot.format = fmt;
         console.log(
