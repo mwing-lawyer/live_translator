@@ -1,6 +1,8 @@
 import { RealtimeClient } from "../openai/RealtimeClient.js";
 import { twilioToOpenAI, openAIToTwilio } from "../audio/codec.js";
+import { LegPipeline } from "../audio/legPipeline.js";
 import { notify } from "../callbacks/notifier.js";
+import { config } from "../config.js";
 
 const STATES = {
   WAITING: "waiting",
@@ -20,23 +22,23 @@ export class TranslationSession {
     this.createdAt = new Date();
     this.onDestroyed = onDestroyed;
 
-    this.callerWs = null;
-    this.repWs = null;
-    this.callerStreamSid = null;
-    this.repStreamSid = null;
-    this.callerLang = null;
-    this.repLang = null;
+    /** Per-leg state: ws, streamSid, ISO language, output pipeline (for this leg's ear). */
+    this.legs = {
+      caller: { ws: null, streamSid: null, lang: null, pipeline: null },
+      rep: { ws: null, streamSid: null, lang: null, pipeline: null },
+    };
 
-    this.callerToRepClient = null;
-    this.repToCallerClient = null;
+    /** Translation directions. Format is the wire format negotiated with OpenAI. */
+    this.callerToRep = { client: null, format: null }; // caller's mic -> rep's ear
+    this.repToCaller = { client: null, format: null }; // rep's mic -> caller's ear
 
     this._audioCounts = { caller: 0, rep: 0 };
-    this._dropLogged = { caller: false, rep: false };
   }
 
   /**
    * Attach a Twilio Media Stream leg to this session.
-   * @param {string} lang - ISO 639-1 language code (e.g. "hi", "en", "es")
+   * @param {"caller" | "rep"} role
+   * @param {string} lang - ISO 639-1 language code spoken by this leg
    */
   attachLeg(role, ws, streamSid, lang) {
     if (this.state === STATES.CLOSING || this.state === STATES.CLOSED) {
@@ -44,110 +46,139 @@ export class TranslationSession {
       return;
     }
 
-    if (role === "caller") {
-      this.callerWs = ws;
-      this.callerStreamSid = streamSid;
-      this.callerLang = lang || "es";
-    } else if (role === "rep") {
-      this.repWs = ws;
-      this.repStreamSid = streamSid;
-      this.repLang = lang || "en";
-    } else {
+    const leg = this.legs[role];
+    if (!leg) {
       console.warn(`Session ${this.sessionId}: unknown role "${role}"`);
       return;
     }
 
-    console.log(`Session ${this.sessionId}: ${role} leg attached (streamSid=${streamSid}, lang=${lang})`);
+    leg.ws = ws;
+    leg.streamSid = streamSid;
+    leg.lang = lang || (role === "caller" ? "es" : "en");
 
-    if (this.callerWs && this.repWs && this.state === STATES.WAITING) {
-      this._startTranslation();
+    console.log(
+      `Session ${this.sessionId}: ${role} leg attached (streamSid=${streamSid}, lang=${leg.lang})`
+    );
+
+    // Per-leg output pipeline starts as soon as this leg attaches so the leg
+    // hears something (even just original audio from the other side once they
+    // arrive). This also drives our bridge-side VAD for soft barge-in.
+    leg.pipeline = new LegPipeline({
+      ws,
+      streamSid,
+      role,
+      sessionId: this.sessionId,
+      onSelfSpeechChange: (isSpeaking) => this._onLegSpeechChange(role, isSpeaking),
+    });
+
+    // Pre-warm: open the OpenAI client that produces translated audio FOR this
+    // leg's ear (target language is this leg's spoken language). The speaker
+    // side may not be present yet; the client just sits ready until audio arrives.
+    this._ensureClientForListener(role);
+
+    const otherRole = role === "caller" ? "rep" : "caller";
+    if (this.legs[otherRole].ws) {
+      this._ensureClientForListener(otherRole);
+      if (this.state === STATES.WAITING) {
+        this.state = STATES.ACTIVE;
+        console.log(
+          `Session ${this.sessionId}: both legs paired, translation active ` +
+          `(${this.legs.caller.lang}->${this.legs.rep.lang} / ` +
+          `${this.legs.rep.lang}->${this.legs.caller.lang})`
+        );
+      }
     }
   }
 
-  _startTranslation() {
-    this.state = STATES.ACTIVE;
-    const dirLabel = `${this.callerLang}->${this.repLang}`;
-    const revLabel = `${this.repLang}->${this.callerLang}`;
-    console.log(`Session ${this.sessionId}: both legs paired, starting translation (${dirLabel} / ${revLabel})`);
+  /**
+   * Ensure the RealtimeClient that produces audio FOR `listenerRole` exists.
+   * The listener leg must be attached (we need its language as the output
+   * target). The speaker leg may or may not be attached yet; OpenAI auto-detects
+   * the source language so the speaker's lang is only used for log lines.
+   */
+  _ensureClientForListener(listenerRole) {
+    const listenerLeg = this.legs[listenerRole];
+    if (!listenerLeg?.lang || !listenerLeg.pipeline) return;
 
-    this.callerToRepClient = new RealtimeClient({
-      sourceLanguage: this.callerLang,
-      targetLanguage: this.repLang,
-      onAudioDelta: (base64Pcm) => {
-        const payload = openAIToTwilio(base64Pcm);
-        this._sendToTwilio(this.repWs, this.repStreamSid, payload);
+    const speakerRole = listenerRole === "rep" ? "caller" : "rep";
+    const directionKey = speakerRole === "caller" ? "callerToRep" : "repToCaller";
+    const slot = this[directionKey];
+    if (slot.client) return;
+
+    const speakerLang = this.legs[speakerRole]?.lang;
+    const targetLang = listenerLeg.lang;
+    const dirLabel = `${speakerLang || "auto"}->${targetLang}`;
+
+    console.log(
+      `Session ${this.sessionId}: opening ${directionKey} (${dirLabel}) ` +
+      `(pre-warm on ${listenerRole}-attach)`
+    );
+
+    slot.client = new RealtimeClient({
+      sourceLanguage: speakerLang || undefined,
+      targetLanguage: targetLang,
+      audioFormat: config.openaiAudioFormat,
+      onAudioFormatNegotiated: (fmt) => {
+        slot.format = fmt;
+        console.log(
+          `Session ${this.sessionId}: ${directionKey} audio format negotiated -> ${fmt}`
+        );
+      },
+      onAudioDelta: (b64) => {
+        // Convert to mulaw if we fell back to PCM16; otherwise native passthrough.
+        const mulaw = slot.format === "pcm16" ? openAIToTwilio(b64) : b64;
+        listenerLeg.pipeline?.pushTranslated(mulaw);
       },
       onTranscript: (text, isFinal) => {
-        notify(this.sessionId, "caller", dirLabel, text, isFinal);
+        notify(this.sessionId, speakerRole, dirLabel, text, isFinal);
       },
       onError: (err) => {
         console.error(`Session ${this.sessionId} ${dirLabel} error:`, err.message);
       },
     });
-
-    this.repToCallerClient = new RealtimeClient({
-      sourceLanguage: this.repLang,
-      targetLanguage: this.callerLang,
-      onAudioDelta: (base64Pcm) => {
-        const payload = openAIToTwilio(base64Pcm);
-        this._sendToTwilio(this.callerWs, this.callerStreamSid, payload);
-      },
-      onTranscript: (text, isFinal) => {
-        notify(this.sessionId, "rep", revLabel, text, isFinal);
-      },
-      onError: (err) => {
-        console.error(`Session ${this.sessionId} ${revLabel} error:`, err.message);
-      },
-    });
   }
 
   /**
-   * Called when a Twilio media chunk arrives from a leg.
+   * Called when a Twilio media frame arrives from a leg.
    */
   onTwilioAudio(role, base64Mulaw) {
-    if (this.state !== STATES.ACTIVE) {
-      if (!this._dropLogged[role]) {
-        console.warn(
-          `Session ${this.sessionId}: dropping audio for role=${role}, state=${this.state}`
-        );
-        this._dropLogged[role] = true;
-      }
-      return;
-    }
+    if (this.state === STATES.CLOSING || this.state === STATES.CLOSED) return;
 
-    const pcm16Base64 = twilioToOpenAI(base64Mulaw);
+    const leg = this.legs[role];
+    if (!leg) return;
 
     this._audioCounts[role] = (this._audioCounts[role] || 0) + 1;
     const n = this._audioCounts[role];
     if (n === 1) {
-      console.log(
-        `Session ${this.sessionId}: first audio frame from ${role} -> RealtimeClient`
-      );
-    } else if (n % 250 === 0) {
-      console.log(
-        `Session ${this.sessionId}: forwarded ${n} frames from ${role}`
-      );
+      console.log(`Session ${this.sessionId}: first audio frame from ${role}`);
+    } else if (n % 500 === 0) {
+      console.log(`Session ${this.sessionId}: ${role} forwarded ${n} frames`);
     }
 
-    if (role === "caller" && this.callerToRepClient) {
-      this.callerToRepClient.sendAudio(pcm16Base64);
-    } else if (role === "rep" && this.repToCallerClient) {
-      this.repToCallerClient.sendAudio(pcm16Base64);
+    // Drive bridge-side VAD on this leg's own mic.
+    leg.pipeline?.pushOwnMic(base64Mulaw);
+
+    // Feed the OTHER leg's ear with this leg's original audio (so they always
+    // hear the speaker, even when the model is silent).
+    const otherRole = role === "caller" ? "rep" : "caller";
+    this.legs[otherRole].pipeline?.pushOriginal(base64Mulaw);
+
+    // Send to OpenAI for translation.
+    const directionKey = role === "caller" ? "callerToRep" : "repToCaller";
+    const slot = this[directionKey];
+    if (slot.client) {
+      const audio = slot.format === "pcm16" ? twilioToOpenAI(base64Mulaw) : base64Mulaw;
+      slot.client.sendAudio(audio);
     }
   }
 
-  _sendToTwilio(ws, streamSid, base64Mulaw) {
-    if (!ws || ws.readyState !== 1) return;
-    ws.send(JSON.stringify({
-      event: "media",
-      streamSid,
-      media: { payload: base64Mulaw },
-    }));
-  }
-
-  _clearTwilioBuffer(ws, streamSid) {
-    if (!ws || ws.readyState !== 1) return;
-    ws.send(JSON.stringify({ event: "clear", streamSid }));
+  _onLegSpeechChange(role, isSpeaking) {
+    if (!isSpeaking) return;
+    if (!config.bargeInHardCut) return;
+    // Hard barge-in: drop the translated audio queued for this leg's ear so the
+    // listener can hear themselves immediately. Soft barge-in (just ducking)
+    // happens inside LegPipeline regardless of this flag.
+    this.legs[role]?.pipeline?.clearTranslated();
   }
 
   onLegDisconnected(role) {
@@ -161,16 +192,18 @@ export class TranslationSession {
     this.state = STATES.CLOSING;
     console.log(`Session ${this.sessionId}: tearing down`);
 
-    this.callerToRepClient?.close();
-    this.repToCallerClient?.close();
+    this.callerToRep.client?.close();
+    this.repToCaller.client?.close();
+    this.callerToRep.client = null;
+    this.repToCaller.client = null;
 
-    if (this.callerWs?.readyState === 1) this.callerWs.close();
-    if (this.repWs?.readyState === 1) this.repWs.close();
-
-    this.callerToRepClient = null;
-    this.repToCallerClient = null;
-    this.callerWs = null;
-    this.repWs = null;
+    for (const role of ["caller", "rep"]) {
+      const leg = this.legs[role];
+      leg.pipeline?.close();
+      leg.pipeline = null;
+      if (leg.ws?.readyState === 1) leg.ws.close();
+      leg.ws = null;
+    }
 
     this.state = STATES.CLOSED;
     this.onDestroyed();
@@ -181,14 +214,16 @@ export class TranslationSession {
       sessionId: this.sessionId,
       state: this.state,
       createdAt: this.createdAt.toISOString(),
-      callerLang: this.callerLang,
-      repLang: this.repLang,
-      callerStreamSid: this.callerStreamSid,
-      repStreamSid: this.repStreamSid,
-      hasCallerLeg: this.callerWs !== null,
-      hasRepLeg: this.repWs !== null,
-      hasCallerToRepClient: this.callerToRepClient !== null,
-      hasRepToCallerClient: this.repToCallerClient !== null,
+      callerLang: this.legs.caller.lang,
+      repLang: this.legs.rep.lang,
+      callerStreamSid: this.legs.caller.streamSid,
+      repStreamSid: this.legs.rep.streamSid,
+      hasCallerLeg: this.legs.caller.ws !== null,
+      hasRepLeg: this.legs.rep.ws !== null,
+      hasCallerToRepClient: this.callerToRep.client !== null,
+      hasRepToCallerClient: this.repToCaller.client !== null,
+      audioFormatCallerToRep: this.callerToRep.format,
+      audioFormatRepToCaller: this.repToCaller.format,
     };
   }
 }

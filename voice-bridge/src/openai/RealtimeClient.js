@@ -9,27 +9,37 @@ export class RealtimeClient {
   /**
    * @param {object} opts
    * @param {string} opts.targetLanguage - ISO 639-1 code for the output language (e.g. "en", "es")
-   * @param {string} [opts.sourceLanguage] - ISO 639-1 code for the source language hint (improves accuracy and latency)
-   * @param {(base64Pcm: string) => void} opts.onAudioDelta - Called per translated audio chunk (PCM16 24 kHz, base64)
-   * @param {(text: string, isFinal: boolean) => void} opts.onTranscript - Called on translated (target-language) transcript events
+   * @param {string} [opts.sourceLanguage] - ISO 639-1 code for the source language (used only in log lines)
+   * @param {"pcmu" | "pcm16"} [opts.audioFormat] - Audio codec to use on the OpenAI link.
+   *        "pcmu" means raw mulaw 8 kHz both directions (matches Twilio, no resample).
+   *        "pcm16" means PCM16 24 kHz (Twilio audio must be resampled by caller).
+   *        Defaults to config.openaiAudioFormat.
+   * @param {(base64Audio: string) => void} opts.onAudioDelta - Called per translated audio chunk.
+   *        With audioFormat="pcmu" the payload is mulaw 8 kHz; with "pcm16" it is PCM16 24 kHz.
+   * @param {(text: string, isFinal: boolean) => void} opts.onTranscript - Called on translated transcript events
    * @param {(text: string, isFinal: boolean) => void} [opts.onSourceTranscript] - Called on source-language transcript events
    * @param {() => void} [opts.onReady] - Called when session is configured and ready
+   * @param {(format: "pcmu" | "pcm16") => void} [opts.onAudioFormatNegotiated] - Called when the
+   *        effective wire format is known (after possible auto-fallback).
    * @param {(err: Error) => void} [opts.onError] - Called on unrecoverable errors
    */
   constructor(opts) {
     this.opts = opts;
     this.targetLanguage = opts.targetLanguage;
     this.sourceLanguage = opts.sourceLanguage;
+    this.audioFormat = opts.audioFormat || config.openaiAudioFormat;
     this.onAudioDelta = opts.onAudioDelta;
     this.onTranscript = opts.onTranscript;
     this.onSourceTranscript = opts.onSourceTranscript || (() => {});
     this.onReady = opts.onReady || (() => {});
+    this.onAudioFormatNegotiated = opts.onAudioFormatNegotiated || (() => {});
     this.onError = opts.onError || ((err) => console.error("RealtimeClient error:", err));
 
     this.closed = false;
     this.reconnectAttempts = 0;
     this.reconnectTimer = null;
     this.ws = null;
+    this._fellBackToPcm16 = false;
 
     this.eventCounts = {};
     this.totalEvents = 0;
@@ -61,18 +71,29 @@ export class RealtimeClient {
     });
   }
 
+  _formatBlock() {
+    return this.audioFormat === "pcmu"
+      ? { type: "audio/pcmu" }
+      : { type: "audio/pcm", rate: 24000 };
+  }
+
   _onOpen() {
-    console.log("OpenAI Realtime Translations WS connected");
+    console.log(`OpenAI Realtime Translations WS connected (audioFormat=${this.audioFormat})`);
     this.reconnectAttempts = 0;
+    const fmt = this._formatBlock();
     const sessionUpdate = {
       type: "session.update",
       session: {
         audio: {
           input: {
+            format: fmt,
             transcription: { model: "gpt-realtime-whisper" },
             noise_reduction: { type: "near_field" },
           },
-          output: { language: this.targetLanguage },
+          output: {
+            format: fmt,
+            language: this.targetLanguage,
+          },
         },
       },
     };
@@ -102,8 +123,9 @@ export class RealtimeClient {
 
       case "session.updated":
         console.log(
-          `OpenAI session configured (source=${this.sourceLanguage || "auto"}, target=${this.targetLanguage})`
+          `OpenAI session configured (source=${this.sourceLanguage || "auto"}, target=${this.targetLanguage}, audioFormat=${this.audioFormat})`
         );
+        this.onAudioFormatNegotiated(this.audioFormat);
         this.onReady();
         break;
 
@@ -139,10 +161,34 @@ export class RealtimeClient {
         this.onSourceTranscript(msg.transcript, true);
         break;
 
-      case "error":
+      case "error": {
+        const err = msg.error || {};
+        const param = err.param || "";
+        const isFormatRejection =
+          err.code === "unknown_parameter" &&
+          /audio\.(input|output)\.format/.test(param);
+        if (isFormatRejection && this.audioFormat === "pcmu" && !this._fellBackToPcm16) {
+          console.warn(
+            `OpenAI rejected audio.*.format=pcmu (${param}); falling back to pcm16 and reconnecting`
+          );
+          this._fellBackToPcm16 = true;
+          this.audioFormat = "pcm16";
+          this.audioPacketsSent = 0;
+          this.eventCounts = {};
+          this.totalEvents = 0;
+          this.firstSeen = new Set();
+          this.unknownEventTypes = new Set();
+          if (this.ws?.readyState === WebSocket.OPEN || this.ws?.readyState === WebSocket.CONNECTING) {
+            this.ws.removeAllListeners();
+            this.ws.close();
+          }
+          this._connect();
+          return;
+        }
         console.error("OpenAI API error:", JSON.stringify(msg.error));
-        this.onError(new Error(msg.error?.message || "OpenAI error"));
+        this.onError(new Error(err.message || "OpenAI error"));
         break;
+      }
 
       default:
         if (!this.unknownEventTypes.has(msg.type)) {
@@ -176,21 +222,22 @@ export class RealtimeClient {
   }
 
   /**
-   * Stream an audio chunk to OpenAI for translation.
-   * @param {string} base64Pcm16 - base64-encoded PCM16 24 kHz audio
+   * Stream an audio chunk to OpenAI for translation. The encoding must match
+   * this client's effective `audioFormat`: mulaw 8 kHz for "pcmu", PCM16 24 kHz for "pcm16".
+   * @param {string} base64Audio
    */
-  sendAudio(base64Pcm16) {
+  sendAudio(base64Audio) {
     this.audioPacketsSent++;
     if (this.audioPacketsSent === 1) {
       console.log(
-        `OpenAI: sending first session.input_audio_buffer.append (bytes=${(base64Pcm16 || "").length})`
+        `OpenAI: sending first session.input_audio_buffer.append (bytes=${(base64Audio || "").length}, format=${this.audioFormat})`
       );
     } else if (this.audioPacketsSent % 250 === 0) {
       console.log(`OpenAI: sent ${this.audioPacketsSent} audio packets`);
     }
     this._send({
       type: "session.input_audio_buffer.append",
-      audio: base64Pcm16,
+      audio: base64Audio,
     });
   }
 
