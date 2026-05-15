@@ -2,6 +2,7 @@ import { RealtimeClient } from "../openai/RealtimeClient.js";
 import { twilioToOpenAI, openAIToTwilio } from "../audio/codec.js";
 import { LegPipeline } from "../audio/legPipeline.js";
 import { notify } from "../callbacks/notifier.js";
+import { buildTranslationPrompt, voiceFor } from "../openai/translationPrompt.js";
 import { config } from "../config.js";
 
 const STATES = {
@@ -117,6 +118,9 @@ export class TranslationSession {
     slot.client = new RealtimeClient({
       sourceLanguage: speakerLang || undefined,
       targetLanguage: targetLang,
+      instructions: buildTranslationPrompt(speakerLang || "auto", targetLang),
+      voice: voiceFor(targetLang),
+      audioFormat: config.openaiAudioFormat,
       logLabel: dirLabel,
       onAudioFormatNegotiated: (fmt) => {
         slot.format = fmt;
@@ -125,7 +129,7 @@ export class TranslationSession {
         );
       },
       onAudioDelta: (b64) => {
-        // Convert to mulaw if we fell back to PCM16; otherwise native passthrough.
+        // g711_ulaw passthrough straight to Twilio; pcm16 needs to be resampled to mulaw 8 kHz first.
         const mulaw = slot.format === "pcm16" ? openAIToTwilio(b64) : b64;
         listenerLeg.pipeline?.pushTranslated(mulaw);
       },
@@ -158,7 +162,8 @@ export class TranslationSession {
     // Drive bridge-side VAD on this leg's own mic.
     leg.pipeline?.pushOwnMic(base64Mulaw);
 
-    // Send to OpenAI for translation.
+    // Send to OpenAI for translation. g711_ulaw is a passthrough; pcm16 needs to be
+    // resampled from Twilio's mulaw 8 kHz up to PCM16 24 kHz first.
     const directionKey = role === "caller" ? "callerToRep" : "repToCaller";
     const slot = this[directionKey];
     if (slot.client) {

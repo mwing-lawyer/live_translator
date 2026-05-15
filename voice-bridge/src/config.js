@@ -12,19 +12,17 @@ const optionalBool = (name, fallback) => {
   return /^(1|true|yes|on)$/i.test(v);
 };
 
-// OPENAI_AUDIO_FORMAT is currently a no-op: the /v1/realtime/translations
-// endpoint hardcodes PCM16 24 kHz. Parsing is kept so older deploys do not
-// crash, but the value is forced to "pcm16" downstream.
-const audioFormat = optional("OPENAI_AUDIO_FORMAT", "pcm16").toLowerCase();
-if (audioFormat !== "pcmu" && audioFormat !== "pcm16") {
-  throw new Error(`OPENAI_AUDIO_FORMAT must be "pcmu" or "pcm16", got "${audioFormat}"`);
+const audioFormat = optional("OPENAI_AUDIO_FORMAT", "g711_ulaw").toLowerCase();
+if (audioFormat !== "g711_ulaw" && audioFormat !== "pcm16") {
+  throw new Error(`OPENAI_AUDIO_FORMAT must be "g711_ulaw" or "pcm16", got "${audioFormat}"`);
 }
 
 export const config = {
   port: parseInt(optional("PORT", "8080"), 10),
   openaiApiKey: required("OPENAI_API_KEY"),
-  openaiModel: optional("OPENAI_MODEL", "gpt-realtime-translate"),
+  openaiModel: optional("OPENAI_MODEL", "gpt-realtime-2"),
   openaiAudioFormat: audioFormat,
+  openaiVoice: optional("OPENAI_VOICE", "verse"),
   callbackUrl: optional("CALLBACK_URL", ""),
   logLevel: optional("LOG_LEVEL", "info"),
 
@@ -33,6 +31,8 @@ export const config = {
     prefixPaddingMs: parseInt(optional("VAD_PREFIX_PADDING_MS", "300"), 10),
     silenceDurationMs: parseInt(optional("VAD_SILENCE_DURATION_MS", "500"), 10),
   },
+
+  turnDetectionSilenceMs: parseInt(optional("TURN_DETECTION_SILENCE_MS", "250"), 10),
 
   bridgeVad: {
     rmsThreshold: parseFloat(optional("BRIDGE_VAD_RMS_THRESHOLD", "600")),
