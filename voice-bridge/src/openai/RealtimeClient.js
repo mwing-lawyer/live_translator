@@ -169,12 +169,12 @@ export class RealtimeClient {
         this.onReady();
         break;
 
-      case "session.output_audio.delta":
+      case "response.output_audio.delta":
         this.audioDeltasReceived++;
         this.lastOutputAudioAt = Date.now();
         this._logFirst(
-          "session.output_audio.delta",
-          `first session.output_audio.delta bytes=${(msg.delta || "").length}`
+          "response.output_audio.delta",
+          `first response.output_audio.delta bytes=${(msg.delta || "").length}`
         );
         if (this.audioDeltasReceived % 250 === 0) {
           this._log(`audio out deltas=${this.audioDeltasReceived}`);
@@ -182,27 +182,46 @@ export class RealtimeClient {
         this.onAudioDelta(msg.delta);
         break;
 
-      case "session.output_audio.done":
+      case "response.output_audio.done":
         break;
 
-      case "session.output_transcript.delta":
+      case "response.output_audio_transcript.delta":
         this._appendTranscript("output", msg.delta);
         this.onTranscript(msg.delta, false);
         break;
 
-      case "session.output_transcript.done":
+      case "response.output_audio_transcript.done":
         this._flushTranscript("output", "done", msg.transcript);
         this.onTranscript(msg.transcript, true);
         break;
 
-      case "session.input_transcript.delta":
+      case "conversation.item.input_audio_transcription.delta":
         this._appendTranscript("input", msg.delta);
         this.onSourceTranscript(msg.delta, false);
         break;
 
-      case "session.input_transcript.done":
+      case "conversation.item.input_audio_transcription.completed":
         this._flushTranscript("input", "done", msg.transcript);
         this.onSourceTranscript(msg.transcript, true);
+        break;
+
+      case "conversation.item.input_audio_transcription.failed":
+        this._log(`input transcription failed: ${JSON.stringify(msg.error || {})}`, "warn");
+        break;
+
+      // Lifecycle / structural events: counted, otherwise ignored.
+      case "response.created":
+      case "response.done":
+      case "response.output_item.added":
+      case "response.output_item.done":
+      case "response.content_part.added":
+      case "response.content_part.done":
+      case "conversation.item.added":
+      case "conversation.item.done":
+      case "input_audio_buffer.speech_started":
+      case "input_audio_buffer.speech_stopped":
+      case "input_audio_buffer.committed":
+      case "rate_limits.updated":
         break;
 
       case "error":

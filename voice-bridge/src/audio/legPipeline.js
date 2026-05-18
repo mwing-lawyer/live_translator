@@ -145,11 +145,11 @@ export class LegPipeline {
 
     const translated = this._popExact("translatedQueue", "translatedLen", FRAME_BYTES);
 
+    // Soft barge-in removed: listener always hears the full translation. Hard
+    // barge-in (config.bargeInHardCut) still flushes the queue via clearTranslated()
+    // and is opt-in.
     let outMulaw;
-    if (translated && this.isSpeaking) {
-      outMulaw = this._silence();
-      this.stats.framesBargedIn++;
-    } else if (translated) {
+    if (translated) {
       outMulaw = translated;
       this.stats.framesTranslated++;
     } else {
